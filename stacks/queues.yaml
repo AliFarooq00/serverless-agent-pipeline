@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Queues stack - ingest buffer queue, its dead-letter queue, and the alarm topic.
+
+Parameters:
+  Stage:
+    Type: String
+  AlarmEmail:
+    Type: String
+    Default: ""
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  IngestDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days - time to inspect and redrive
+      SqsManagedSseEnabled: true
+      Tags:
+        - { Key: stage, Value: !Ref Stage }
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # >= 6x the starter function timeout (10s), per the Lambda/SQS guidance.
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600    # 4 days
+      ReceiveMessageWaitTimeSeconds: 20 # long polling
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - { Key: stage, Value: !Ref Stage }
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - { Key: stage, Value: !Ref Stage }
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the ingest DLQ - tickets were accepted but never started.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oldest ingest message is older than 5 minutes - the starter is stuck or throttled.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  QueueUrl:
+    Value: !Ref IngestQueue
+  QueueArn:
+    Value: !GetAtt IngestQueue.Arn
+  DeadLetterQueueUrl:
+    Value: !Ref IngestDeadLetterQueue
+  DeadLetterQueueArn:
+    Value: !GetAtt IngestDeadLetterQueue.Arn
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
