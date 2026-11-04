@@ -1,0 +1,30 @@
+# Extraction registry for the Extractor agent.
+#
+# Adding a field is a config-only change: append an entry, deploy. The JSON schema sent to the
+# model, the prompt, and output validation are all generated from this file.
+#
+#   type: string | enum | boolean | integer   (every field is nullable - "not mentioned" = null)
+#   values: required for enum (lower-case)
+#   pattern: optional full-match regex for string fields
+version: "2026-11-01"
+
+fields:
+  - name: product_area
+    type: enum
+    values: [editor, sync, sharing, search, billing, mobile_app, desktop_app, integrations, other]
+    description: The part of Acme Notes the ticket is about.
+
+  - name: error_code
+    type: string
+    pattern: "^[A-Z]{2,6}-[0-9]{3,5}$"
+    description: An Acme Notes error code quoted by the customer, e.g. SYNC-409. Null if none.
+
+  - name: os
+    type: enum
+    values: [windows, macos, linux, ios, android, web, unknown]
+    description: Operating system or platform the customer is using.
+
+  - name: app_version
+    type: string
+    pattern: "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"
+    description: Acme Notes app version if stated, e.g. 4.12.1.
