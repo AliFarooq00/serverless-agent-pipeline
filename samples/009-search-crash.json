@@ -1,0 +1,5 @@
+{
+  "subject": "Search crashes the mac app",
+  "body": "Every time I search for a tag the desktop app crashes on macOS. Version 4.11.0. Error SRCH-5001 shows briefly before it closes.",
+  "customer_tier": "pro"
+}

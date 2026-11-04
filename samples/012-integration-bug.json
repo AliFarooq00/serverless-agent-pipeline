@@ -1,0 +1,5 @@
+{
+  "subject": "Calendar integration not creating notes",
+  "body": "The Google Calendar integration stopped creating meeting notes for new events. Integration error INTG-4031. Using the web app in Chrome.",
+  "customer_tier": "enterprise"
+}

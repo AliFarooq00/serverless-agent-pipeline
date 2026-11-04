@@ -1,0 +1,5 @@
+{
+  "subject": "Editor freezes with large tables - please escalate to engineering",
+  "body": "The editor freezes for 10+ seconds when I paste a table with more than 200 rows on Linux. Please escalate to engineering, this blocks my work.",
+  "customer_tier": "business"
+}

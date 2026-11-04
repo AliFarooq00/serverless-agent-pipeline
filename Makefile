@@ -14,7 +14,7 @@ lint:
 	ruff check .
 	ruff format --check .
 	cfn-lint $(TEMPLATES)
-	$(PY) -m json.tool statemachine/triage.asl.json > /dev/null
+	$(PY) scripts/lint_asl.py
 
 fmt:
 	ruff format .

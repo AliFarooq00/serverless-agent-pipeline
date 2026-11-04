@@ -1,0 +1,629 @@
+{
+  "Comment": "Acme Notes ticket triage: planner -> specialist agents (Map) -> reviewer guardrail (max 1 revision) -> persist. Every task retries throttling/5xx with exponential backoff + jitter and catches to MarkFailed.",
+  "StartAt": "Initialize",
+  "TimeoutSeconds": 900,
+  "States": {
+    "Initialize": {
+      "Type": "Pass",
+      "Comment": "Normalise state shape. review_loop.max_revisions is the single source of truth for the reviewer loop limit.",
+      "Parameters": {
+        "ticket_id.$": "$.ticket_id",
+        "ticket.$": "$.ticket",
+        "received_at.$": "$.received_at",
+        "execution_arn.$": "$$.Execution.Id",
+        "review": null,
+        "review_loop": {
+          "revision": 0,
+          "max_revisions": 1,
+          "previous_review": null,
+          "redraft": null
+        }
+      },
+      "Next": "MarkProcessing"
+    },
+    "MarkProcessing": {
+      "Type": "Task",
+      "Comment": "Direct DynamoDB integration - no Lambda needed for a status flip.",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "pk": {
+            "S.$": "States.Format('TICKET#{}', $.ticket_id)"
+          },
+          "sk": {
+            "S": "META"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :now, execution_arn = :arn, gsi1pk = :gsi1pk, gsi1sk = :now",
+        "ConditionExpression": "attribute_exists(pk)",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "PROCESSING"
+          },
+          ":gsi1pk": {
+            "S": "STATUS#PROCESSING"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":arn": {
+            "S.$": "$$.Execution.Id"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ProvisionedThroughputExceededException",
+            "DynamoDB.ThrottlingException",
+            "DynamoDB.RequestLimitExceeded",
+            "DynamoDB.InternalServerErrorException",
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "Plan"
+    },
+    "Plan": {
+      "Type": "Task",
+      "Resource": "${PlannerFunctionArn}",
+      "TimeoutSeconds": 90,
+      "Parameters": {
+        "ticket_id.$": "$.ticket_id",
+        "ticket.$": "$.ticket"
+      },
+      "ResultPath": "$.plan",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.Unknown"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMThrottledError",
+            "LLMUnavailableError",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMResponseError"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "RunSpecialists"
+    },
+    "RunSpecialists": {
+      "Type": "Map",
+      "Comment": "Fan out to the specialist agents the (validated) plan selected.",
+      "ItemsPath": "$.plan.steps",
+      "ItemSelector": {
+        "step.$": "$$.Map.Item.Value",
+        "ticket_id.$": "$.ticket_id",
+        "ticket.$": "$.ticket"
+      },
+      "MaxConcurrency": 3,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "RouteStep",
+        "States": {
+          "RouteStep": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.step",
+                "StringEquals": "classify",
+                "Next": "Classify"
+              },
+              {
+                "Variable": "$.step",
+                "StringEquals": "extract",
+                "Next": "Extract"
+              },
+              {
+                "Variable": "$.step",
+                "StringEquals": "draft_reply",
+                "Next": "DraftReply"
+              }
+            ],
+            "Default": "UnknownStep"
+          },
+          "Classify": {
+            "Type": "Task",
+            "Resource": "${ClassifierFunctionArn}",
+            "TimeoutSeconds": 90,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.Unknown"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 4,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 20,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMThrottledError",
+                  "LLMUnavailableError",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMResponseError"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 1,
+                "BackoffRate": 1.0
+              }
+            ],
+            "End": true
+          },
+          "Extract": {
+            "Type": "Task",
+            "Resource": "${ExtractorFunctionArn}",
+            "TimeoutSeconds": 90,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.Unknown"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 4,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 20,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMThrottledError",
+                  "LLMUnavailableError",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMResponseError"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 1,
+                "BackoffRate": 1.0
+              }
+            ],
+            "End": true
+          },
+          "DraftReply": {
+            "Type": "Task",
+            "Resource": "${ResponderFunctionArn}",
+            "TimeoutSeconds": 90,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.Unknown"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 4,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 20,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMThrottledError",
+                  "LLMUnavailableError",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "MaxDelaySeconds": 60,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "LLMResponseError"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 1,
+                "BackoffRate": 1.0
+              }
+            ],
+            "End": true
+          },
+          "UnknownStep": {
+            "Type": "Fail",
+            "Error": "PlanValidationError",
+            "Cause": "Step is not on the allow-list (defence in depth; the planner already filters)."
+          }
+        }
+      },
+      "ResultPath": "$.results",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "NeedsReview"
+    },
+    "NeedsReview": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.plan.requires_review",
+          "BooleanEquals": true,
+          "Next": "Review"
+        }
+      ],
+      "Default": "SetCompleted"
+    },
+    "Review": {
+      "Type": "Task",
+      "Resource": "${ReviewerFunctionArn}",
+      "TimeoutSeconds": 90,
+      "Parameters": {
+        "ticket_id.$": "$.ticket_id",
+        "ticket.$": "$.ticket",
+        "results.$": "$.results",
+        "redraft.$": "$.review_loop.redraft",
+        "revision.$": "$.review_loop.revision"
+      },
+      "ResultPath": "$.review",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.Unknown"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMThrottledError",
+            "LLMUnavailableError",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMResponseError"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ReviewDecision"
+    },
+    "ReviewDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.review.verdict",
+          "StringEquals": "approve",
+          "Next": "SetCompleted"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.review.verdict",
+              "StringEquals": "revise"
+            },
+            {
+              "Variable": "$.review_loop.revision",
+              "NumericLessThanPath": "$.review_loop.max_revisions"
+            }
+          ],
+          "Next": "PrepareRevision"
+        }
+      ],
+      "Default": "SetNeedsHuman"
+    },
+    "PrepareRevision": {
+      "Type": "Pass",
+      "Parameters": {
+        "revision.$": "States.MathAdd($.review_loop.revision, 1)",
+        "max_revisions.$": "$.review_loop.max_revisions",
+        "previous_review.$": "$.review",
+        "redraft.$": "$.review_loop.redraft"
+      },
+      "ResultPath": "$.review_loop",
+      "Next": "Redraft"
+    },
+    "Redraft": {
+      "Type": "Task",
+      "Resource": "${ResponderFunctionArn}",
+      "TimeoutSeconds": 90,
+      "Parameters": {
+        "step": "draft_reply",
+        "ticket_id.$": "$.ticket_id",
+        "ticket.$": "$.ticket",
+        "results.$": "$.results",
+        "redraft.$": "$.review_loop.redraft",
+        "feedback.$": "$.review.feedback",
+        "revision.$": "$.review_loop.revision"
+      },
+      "ResultPath": "$.review_loop.redraft",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.Unknown"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMThrottledError",
+            "LLMUnavailableError",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMResponseError"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "Review"
+    },
+    "SetCompleted": {
+      "Type": "Pass",
+      "Result": "COMPLETED",
+      "ResultPath": "$.final_status",
+      "Next": "Persist"
+    },
+    "SetNeedsHuman": {
+      "Type": "Pass",
+      "Result": "NEEDS_HUMAN",
+      "ResultPath": "$.final_status",
+      "Next": "Persist"
+    },
+    "Persist": {
+      "Type": "Task",
+      "Resource": "${PersistFunctionArn}",
+      "TimeoutSeconds": 90,
+      "ResultPath": "$.persisted",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.Unknown"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMThrottledError",
+            "LLMUnavailableError",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "LLMResponseError"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "OutputPath": "$.persisted",
+      "Next": "Done"
+    },
+    "Done": {
+      "Type": "Succeed"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "pk": {
+            "S.$": "States.Format('TICKET#{}', $.ticket_id)"
+          },
+          "sk": {
+            "S": "META"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :now, gsi1pk = :gsi1pk, gsi1sk = :now, #error = :error, #cause = :cause",
+        "ExpressionAttributeNames": {
+          "#status": "status",
+          "#error": "error",
+          "#cause": "cause"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "FAILED"
+          },
+          ":gsi1pk": {
+            "S": "STATUS#FAILED"
+          },
+          ":now": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":error": {
+            "S.$": "$.error.Error"
+          },
+          ":cause": {
+            "S.$": "$.error.Cause"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ProvisionedThroughputExceededException",
+            "DynamoDB.ThrottlingException",
+            "DynamoDB.RequestLimitExceeded",
+            "DynamoDB.InternalServerErrorException",
+            "DynamoDB.AmazonDynamoDBException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 20,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.mark_failed_error",
+          "Next": "ExecutionFailed"
+        }
+      ],
+      "Next": "ExecutionFailed"
+    },
+    "ExecutionFailed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

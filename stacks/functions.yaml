@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Functions stack - shared layer and every Lambda, each with its own least-privilege role.
+
+Parameters:
+  Stage:
+    Type: String
+  TableName:
+    Type: String
+  TableArn:
+    Type: String
+  BucketName:
+    Type: String
+  BucketArn:
+    Type: String
+  QueueUrl:
+    Type: String
+  QueueArn:
+    Type: String
+  StateMachineName:
+    Type: String
+  LlmProvider:
+    Type: String
+    AllowedValues: [fake, openai, anthropic]
+  LlmModel:
+    Type: String
+    Default: ""
+  SecretsPathPrefix:
+    Type: String
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Handler: app.lambda_handler
+    MemorySize: 512
+    Timeout: 60
+    Tracing: Active
+    Layers: [!Ref CommonLayer]
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        TABLE_NAME: !Ref TableName
+        POWERTOOLS_SERVICE_NAME: acme-triage
+        POWERTOOLS_METRICS_NAMESPACE: AcmeNotes/Triage
+        POWERTOOLS_LOG_LEVEL: INFO
+        LLM_PROVIDER: !Ref LlmProvider
+        LLM_MODEL: !Ref LlmModel
+        # Only the *name* of the SecureString lives here; the value is fetched at cold start.
+        LLM_API_KEY_PARAM: !Sub "${SecretsPathPrefix}/${LlmProvider}-api-key"
+        LLM_TIMEOUT_SECONDS: "25"
+    Tags:
+      stage: !Ref Stage
+
+Resources:
+  # --------------------------------------------------------------------------- layer
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      Description: acme_common - LLM clients, agents runtime, registry, Powertools.
+      ContentUri: ../layers/common/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+    Metadata:
+      # Makefile build: installs arm64 wheels and bundles config/extraction_registry.yaml.
+      BuildMethod: makefile
+      BuildArchitecture: arm64
+
+  # --------------------------------------------------------------------------- ingest
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: POST /tickets - validate, idempotency, archive, PENDING row, enqueue.
+      CodeUri: ../functions/ingest/
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref IngestLogGroup
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          QUEUE_URL: !Ref QueueUrl
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: TicketAndIdempotencyRecords
+              Effect: Allow
+              # Delete is needed by Powertools to release an in-progress idempotency record
+              # when the handler fails, so the client can retry.
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource: !Ref TableArn
+            - Sid: ArchiveRawPayload
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${BucketArn}/raw/*"
+            - Sid: Enqueue
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Ref QueueArn
+
+  # --------------------------------------------------------------------------- starter
+  StarterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  StarterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: SQS -> StartExecution (execution name = ticket_id).
+      CodeUri: ../functions/starter/
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref StarterLogGroup
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${StateMachineName}"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: StartTriage
+              Effect: Allow
+              Action: states:StartExecution
+              Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${StateMachineName}"
+            - Sid: ConsumeIngestQueue
+              Effect: Allow
+              # Scoped to the one queue (SAM's SQS event would attach a managed policy with "*").
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:ChangeMessageVisibility
+                - sqs:GetQueueAttributes
+              Resource: !Ref QueueArn
+
+  StarterEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref StarterFunction
+      EventSourceArn: !Ref QueueArn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        # Back-pressure: caps concurrent workflow starts and therefore concurrent LLM load.
+        MaximumConcurrency: 5
+
+  # --------------------------------------------------------------------------- agents
+  PlannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  PlannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Planner agent - selects specialist steps (allow-list validated).
+      CodeUri: ../functions/planner/
+      LoggingConfig:
+        LogGroup: !Ref PlannerLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadLlmApiKey
+              Effect: Allow
+              # SecureStrings use the AWS-managed aws/ssm key, whose key policy authorises
+              # decryption for callers allowed to GetParameter - no kms:Decrypt grant needed.
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  ClassifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ClassifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Classifier agent - category, priority, sentiment.
+      CodeUri: ../functions/classifier/
+      LoggingConfig:
+        LogGroup: !Ref ClassifierLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadLlmApiKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  ExtractorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExtractorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Extractor agent - fields from config/extraction_registry.yaml.
+      CodeUri: ../functions/extractor/
+      LoggingConfig:
+        LogGroup: !Ref ExtractorLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadLlmApiKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  ResponderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ResponderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Responder agent - drafts (and redrafts) the customer reply.
+      CodeUri: ../functions/responder/
+      LoggingConfig:
+        LogGroup: !Ref ResponderLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadLlmApiKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  ReviewerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReviewerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Reviewer agent - policy guardrail on the draft.
+      CodeUri: ../functions/reviewer/
+      LoggingConfig:
+        LogGroup: !Ref ReviewerLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadLlmApiKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  PersistLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  PersistFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Writes the final result, agent usage and totals to DynamoDB.
+      CodeUri: ../functions/persist/
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref PersistLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: FinaliseTicket
+              Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !Ref TableArn
+
+Outputs:
+  IngestFunctionArn:
+    Value: !GetAtt IngestFunction.Arn
+  PlannerFunctionArn:
+    Value: !GetAtt PlannerFunction.Arn
+  ClassifierFunctionArn:
+    Value: !GetAtt ClassifierFunction.Arn
+  ExtractorFunctionArn:
+    Value: !GetAtt ExtractorFunction.Arn
+  ResponderFunctionArn:
+    Value: !GetAtt ResponderFunction.Arn
+  ReviewerFunctionArn:
+    Value: !GetAtt ReviewerFunction.Arn
+  PersistFunctionArn:
+    Value: !GetAtt PersistFunction.Arn

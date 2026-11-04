@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: State machine stack - the STANDARD triage workflow and its alarms.
+
+Parameters:
+  Stage:
+    Type: String
+  StateMachineName:
+    Type: String
+  TableName:
+    Type: String
+  TableArn:
+    Type: String
+  PlannerFunctionArn:
+    Type: String
+  ClassifierFunctionArn:
+    Type: String
+  ExtractorFunctionArn:
+    Type: String
+  ResponderFunctionArn:
+    Type: String
+  ReviewerFunctionArn:
+    Type: String
+  PersistFunctionArn:
+    Type: String
+  AlarmTopicArn:
+    Type: String
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Resources:
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${StateMachineName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TriageStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Ref StateMachineName
+      Type: STANDARD
+      DefinitionUri: ../statemachine/triage.asl.json
+      DefinitionSubstitutions:
+        TableName: !Ref TableName
+        PlannerFunctionArn: !Ref PlannerFunctionArn
+        ClassifierFunctionArn: !Ref ClassifierFunctionArn
+        ExtractorFunctionArn: !Ref ExtractorFunctionArn
+        ResponderFunctionArn: !Ref ResponderFunctionArn
+        ReviewerFunctionArn: !Ref ReviewerFunctionArn
+        PersistFunctionArn: !Ref PersistFunctionArn
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false   # ticket text is customer data - keep it out of logs
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: InvokeAgentFunctions
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Ref PlannerFunctionArn
+                - !Ref ClassifierFunctionArn
+                - !Ref ExtractorFunctionArn
+                - !Ref ResponderFunctionArn
+                - !Ref ReviewerFunctionArn
+                - !Ref PersistFunctionArn
+            - Sid: StatusUpdates
+              Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !Ref TableArn
+            - Sid: VendedLogDelivery
+              Effect: Allow
+              # CloudWatch Logs vended-log delivery APIs do not support resource-level
+              # permissions; AWS documents Resource "*" as required here.
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+            - Sid: XRay
+              Effect: Allow
+              # X-Ray trace submission has no resource-level permissions; "*" is required.
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+              Resource: "*"
+      Tags:
+        stage: !Ref Stage
+
+  ExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Triage executions are failing (ticket marked FAILED).
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TriageStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  ExecutionsTimedOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Triage executions are timing out.
+      Namespace: AWS/States
+      MetricName: ExecutionsTimedOut
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TriageStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref TriageStateMachine

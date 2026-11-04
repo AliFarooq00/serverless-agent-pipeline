@@ -1,0 +1,5 @@
+{
+  "subject": "Acme Notes is down for our whole team",
+  "body": "Nobody on our team can access Acme Notes since 09:10 UTC. The web app returns HTTP 500 and the desktop app spins forever. We have 400 users blocked.",
+  "customer_tier": "enterprise"
+}
