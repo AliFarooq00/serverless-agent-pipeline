@@ -23,9 +23,9 @@ tags = "project=\"serverless-agent-pipeline\" app=\"acme-notes-triage\" stage=\"
 parameter_overrides = [
   "Stage=dev",
   "LlmProvider=fake",          # fake | openai | anthropic  (fake needs no API key)
-  "LlmModel=",                 # empty = provider default
   "SecretsPathPrefix=/acme-notes/triage",
-  "AlarmEmail=",               # e.g. oncall@example.com - leave empty to skip the subscription
+  # "LlmModel=gpt-4.1-mini",          # omit to use the provider default
+  # "AlarmEmail=oncall@example.com",  # omit to skip the alarm e-mail subscription
 ]
 
 [default.delete.parameters]
@@ -49,7 +49,5 @@ tags = "project=\"serverless-agent-pipeline\" app=\"acme-notes-triage\" stage=\"
 parameter_overrides = [
   "Stage=prod",
   "LlmProvider=anthropic",
-  "LlmModel=",
   "SecretsPathPrefix=/acme-notes/triage",
-  "AlarmEmail=",
 ]

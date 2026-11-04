@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: API stack - REST API (API key + usage plan, request validation) in front of ingest/get.
+
+Parameters:
+  Stage:
+    Type: String
+  IngestFunctionArn:
+    Type: String
+  GetTicketFunctionArn:
+    Type: String
+  ThrottleRateLimit:
+    Type: Number
+    Default: 20
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 40
+  DailyQuota:
+    Type: Number
+    Default: 10000
+
+Resources:
+  TicketsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-tickets"
+      StageName: !Ref Stage
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingRateLimit: !Ref ThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: Acme Notes ticket triage
+          version: "1.0"
+        x-amazon-apigateway-api-key-source: HEADER
+        x-amazon-apigateway-request-validators:
+          body:
+            validateRequestBody: true
+            validateRequestParameters: true
+          params:
+            validateRequestBody: false
+            validateRequestParameters: true
+        securityDefinitions:
+          api_key:
+            type: apiKey
+            name: x-api-key
+            in: header
+        definitions:
+          TicketRequest:
+            type: object
+            additionalProperties: false
+            required: [subject, body, customer_tier]
+            properties:
+              subject: { type: string, minLength: 1, maxLength: 200 }
+              body: { type: string, minLength: 1, maxLength: 10000 }
+              customer_tier: { type: string, enum: [free, pro, business, enterprise] }
+        paths:
+          /tickets:
+            post:
+              summary: Submit a support ticket for triage.
+              consumes: [application/json]
+              produces: [application/json]
+              security: [{ api_key: [] }]
+              x-amazon-apigateway-request-validator: body
+              parameters:
+                - name: body
+                  in: body
+                  required: true
+                  schema: { $ref: "#/definitions/TicketRequest" }
+                - name: Idempotency-Key
+                  in: header
+                  required: false
+                  type: string
+              responses:
+                "202": { description: Accepted }
+                "400": { description: Invalid ticket }
+                "422": { description: Idempotency-Key reused with a different payload }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestFunctionArn}/invocations"
+          /tickets/{ticket_id}:
+            get:
+              summary: Fetch a ticket's status and triage result.
+              produces: [application/json]
+              security: [{ api_key: [] }]
+              x-amazon-apigateway-request-validator: params
+              parameters:
+                - name: ticket_id
+                  in: path
+                  required: true
+                  type: string
+              responses:
+                "200": { description: OK }
+                "404": { description: Not found }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetTicketFunctionArn}/invocations"
+      Tags:
+        stage: !Ref Stage
+
+  IngestInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunctionArn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TicketsApi}/*/POST/tickets"
+
+  GetTicketInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetTicketFunctionArn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TicketsApi}/*/GET/tickets/*"
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: TicketsApiStage   # SAM-generated stage resource (<ApiLogicalId>Stage)
+    Properties:
+      Name: !Sub "${AWS::StackName}-default"
+      Description: Default client key for the triage API (value is never output by CloudFormation).
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: TicketsApiStage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-default"
+      ApiStages:
+        - ApiId: !Ref TicketsApi
+          Stage: !Ref Stage
+      Throttle:
+        RateLimit: !Ref ThrottleRateLimit
+        BurstLimit: !Ref ThrottleBurstLimit
+      Quota:
+        Limit: !Ref DailyQuota
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${TicketsApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Stage}"
+  ApiKeyId:
+    Value: !Ref ApiKey

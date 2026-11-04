@@ -277,6 +277,29 @@ Resources:
               Action: dynamodb:UpdateItem
               Resource: !Ref TableArn
 
+  # --------------------------------------------------------------------------- read API
+  GetTicketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  GetTicketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: GET /tickets/{ticket_id}.
+      CodeUri: ../functions/get_ticket/
+      Timeout: 5
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref GetTicketLogGroup
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadTicket
+              Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !Ref TableArn
+
 Outputs:
   IngestFunctionArn:
     Value: !GetAtt IngestFunction.Arn
@@ -292,3 +315,5 @@ Outputs:
     Value: !GetAtt ReviewerFunction.Arn
   PersistFunctionArn:
     Value: !GetAtt PersistFunction.Arn
+  GetTicketFunctionArn:
+    Value: !GetAtt GetTicketFunction.Arn

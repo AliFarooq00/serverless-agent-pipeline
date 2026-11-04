@@ -16,6 +16,9 @@ build-CommonLayer:
 		--target "$(SITE)" \
 		--platform manylinux2014_aarch64 --implementation cp --python-version 3.12 \
 		--only-binary=:all: --upgrade
+	# boto3/botocore come with the Lambda runtime (pulled in transitively by aws-xray-sdk);
+	# shipping a second copy would add ~25 MB to every cold start for nothing.
+	rm -rf "$(SITE)"/botocore* "$(SITE)"/boto3* "$(SITE)"/s3transfer* "$(SITE)/bin"
 	cp -R "$(MAKEFILE_DIR)/acme_common" "$(SITE)/"
 	mkdir -p "$(SITE)/acme_common/config"
 	cp "$(REPO_ROOT)/config/extraction_registry.yaml" "$(SITE)/acme_common/config/"

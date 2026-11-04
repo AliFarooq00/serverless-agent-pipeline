@@ -52,6 +52,7 @@ def pipeline(aws):
             "responder",
             "reviewer",
             "persist",
+            "get_ticket",
         )
     }
     ddb = boto3.client("dynamodb", region_name=REGION)
@@ -105,7 +106,19 @@ def pipeline(aws):
             executionArn=arn.replace(":stateMachine:", ":execution:") + f":{ticket_id}"
         )
         result = simulator.run(json.loads(execution["input"]), name=ticket_id)
-        return ticket_id, result, fns["persist"]._store.get(ticket_id)
+
+        # Read the result back through the public API handler, as a client would.
+        get_event = api_event(
+            "GET",
+            f"/tickets/{ticket_id}",
+            resource="/tickets/{ticket_id}",
+            path_params={"ticket_id": ticket_id},
+        )
+        got = fns["get_ticket"].lambda_handler(get_event, CTX)
+        assert got["statusCode"] == 200
+        item = json.loads(got["body"])
+        assert item["terminal"] is True
+        return ticket_id, result, item
 
     yield {"submit": submit, "fns": fns, "sfn": sfn, "arn": arn, "aws": aws}
     set_llm_client(None)
