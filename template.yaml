@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  serverless-agent-pipeline - planning-driven multi-agent triage of support tickets
+  for the fictional "Acme Notes" SaaS product. Root stack: wires the nested stacks together.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z][a-z0-9-]{1,15}$"
+  LlmProvider:
+    Type: String
+    Default: fake
+    AllowedValues: [fake, openai, anthropic]
+    Description: fake runs a deterministic heuristic model - no API key, no cost.
+  LlmModel:
+    Type: String
+    Default: ""
+    Description: Model id for the chosen provider. Empty = provider default (see acme_common/llm/factory.py).
+  SecretsPathPrefix:
+    Type: String
+    Default: /acme-notes/triage
+    AllowedPattern: "^/[a-zA-Z0-9_./-]+$"
+    Description: >
+      SSM path holding SecureString API keys (<prefix>/openai-api-key, <prefix>/anthropic-api-key).
+      Create them out-of-band; they are never passed through CloudFormation.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional address subscribed to the alarm topic. Empty = no subscription.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Resources:
+  DataStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: stacks/data.yaml
+      Parameters:
+        Stage: !Ref Stage
+
+  QueuesStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: stacks/queues.yaml
+      Parameters:
+        Stage: !Ref Stage
+        AlarmEmail: !Ref AlarmEmail
+
+  FunctionsStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: stacks/functions.yaml
+      Parameters:
+        Stage: !Ref Stage
+        TableName: !GetAtt DataStack.Outputs.TableName
+        TableArn: !GetAtt DataStack.Outputs.TableArn
+        BucketName: !GetAtt DataStack.Outputs.BucketName
+        BucketArn: !GetAtt DataStack.Outputs.BucketArn
+        QueueUrl: !GetAtt QueuesStack.Outputs.QueueUrl
+        QueueArn: !GetAtt QueuesStack.Outputs.QueueArn
+        # The state machine lives in a later stack; its ARN is derived from a fixed
+        # name so the starter function can be granted StartExecution without a cycle.
+        StateMachineName: !Sub "${AWS::StackName}-triage"
+        LlmProvider: !Ref LlmProvider
+        LlmModel: !Ref LlmModel
+        SecretsPathPrefix: !Ref SecretsPathPrefix
+        LogRetentionDays: !Ref LogRetentionDays
+
+  StateMachineStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: stacks/statemachine.yaml
+      Parameters:
+        Stage: !Ref Stage
+        StateMachineName: !Sub "${AWS::StackName}-triage"
+        TableName: !GetAtt DataStack.Outputs.TableName
+        TableArn: !GetAtt DataStack.Outputs.TableArn
+        PlannerFunctionArn: !GetAtt FunctionsStack.Outputs.PlannerFunctionArn
+        ClassifierFunctionArn: !GetAtt FunctionsStack.Outputs.ClassifierFunctionArn
+        ExtractorFunctionArn: !GetAtt FunctionsStack.Outputs.ExtractorFunctionArn
+        ResponderFunctionArn: !GetAtt FunctionsStack.Outputs.ResponderFunctionArn
+        ReviewerFunctionArn: !GetAtt FunctionsStack.Outputs.ReviewerFunctionArn
+        PersistFunctionArn: !GetAtt FunctionsStack.Outputs.PersistFunctionArn
+        AlarmTopicArn: !GetAtt QueuesStack.Outputs.AlarmTopicArn
+        LogRetentionDays: !Ref LogRetentionDays
+
+  ApiStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: stacks/api.yaml
+      Parameters:
+        Stage: !Ref Stage
+        IngestFunctionArn: !GetAtt FunctionsStack.Outputs.IngestFunctionArn
+        GetTicketFunctionArn: !GetAtt FunctionsStack.Outputs.GetTicketFunctionArn
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the REST API (append /tickets).
+    Value: !GetAtt ApiStack.Outputs.ApiUrl
+  ApiKeyId:
+    Description: "API key id. Fetch the value with: aws apigateway get-api-key --api-key <id> --include-value"
+    Value: !GetAtt ApiStack.Outputs.ApiKeyId
+  TableName:
+    Value: !GetAtt DataStack.Outputs.TableName
+  BucketName:
+    Value: !GetAtt DataStack.Outputs.BucketName
+  StateMachineArn:
+    Value: !GetAtt StateMachineStack.Outputs.StateMachineArn
+  DeadLetterQueueUrl:
+    Value: !GetAtt QueuesStack.Outputs.DeadLetterQueueUrl

@@ -1,0 +1,55 @@
+# SAM CLI configuration. All values below are placeholders - nothing here
+# identifies a real AWS account. Override per environment with --config-env.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "acme-notes-triage-dev"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "acme-notes-triage-dev"
+tags = "project=\"serverless-agent-pipeline\" app=\"acme-notes-triage\" stage=\"dev\""
+parameter_overrides = [
+  "Stage=dev",
+  "LlmProvider=fake",          # fake | openai | anthropic  (fake needs no API key)
+  "LlmModel=",                 # empty = provider default
+  "SecretsPathPrefix=/acme-notes/triage",
+  "AlarmEmail=",               # e.g. oncall@example.com - leave empty to skip the subscription
+]
+
+[default.delete.parameters]
+no_prompts = true
+
+# --- prod: same template, real LLM provider -------------------------------
+[prod.global.parameters]
+stack_name = "acme-notes-triage-prod"
+region = "us-east-1"
+
+[prod.build.parameters]
+cached = true
+parallel = true
+
+[prod.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "acme-notes-triage-prod"
+tags = "project=\"serverless-agent-pipeline\" app=\"acme-notes-triage\" stage=\"prod\""
+parameter_overrides = [
+  "Stage=prod",
+  "LlmProvider=anthropic",
+  "LlmModel=",
+  "SecretsPathPrefix=/acme-notes/triage",
+  "AlarmEmail=",
+]

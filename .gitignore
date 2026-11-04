@@ -1,0 +1,16 @@
+.aws-sam/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.env
+.env.*
+samconfig.local.toml
+.idea/
+.vscode/
+.DS_Store

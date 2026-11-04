@@ -1,0 +1,13 @@
+# Runtime deps used by the Lambda layer (mirrors layers/common/requirements.txt)
+-r layers/common/requirements.txt
+
+# Provided by the Lambda runtime, needed locally
+boto3>=1.35
+
+# Tooling
+pytest>=8.3
+pytest-cov>=5.0
+moto[dynamodb,s3,sqs,stepfunctions,ssm]>=5.0
+ruff>=0.8
+cfn-lint>=1.20
+aws-xray-sdk>=2.14
