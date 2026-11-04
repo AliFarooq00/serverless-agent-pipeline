@@ -28,3 +28,4 @@ known-first-party = ["acme_common"]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 markers = ["integration: uses moto-mocked AWS services"]
+filterwarnings = ["ignore:No application metrics to publish:UserWarning"]
