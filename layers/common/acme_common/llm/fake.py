@@ -112,7 +112,19 @@ class FakeLLM(LLMClient):
             category = "feature_request"
         elif _has(text, "how do i", "how to", "is there a way"):
             category = "how_to"
-        elif _has(text, "error", "crash", "bug", "stuck", "sync", "broken", "not working"):
+        elif _has(
+            text,
+            "error",
+            "crash",
+            "bug",
+            "stuck",
+            "sync",
+            "broken",
+            "not working",
+            "freez",
+            "deleted",
+            "lost",
+        ):
             category = "bug"
         else:
             category = "other"
@@ -131,6 +143,8 @@ class FakeLLM(LLMClient):
         )
         if sentiment == "angry" and priority in ("p3", "p4"):
             priority = "p2"
+        if _has(text, "unsubscribe", "seo services", "backlinks"):
+            priority = "p4"
         return {
             "category": category,
             "priority": priority,
